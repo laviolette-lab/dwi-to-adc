@@ -263,11 +263,7 @@ fn dicom_b_value(object: &dicom_object::DefaultDicomObject) -> Option<f64> {
         }
     }
 
-    object
-        .element_by_name("DiffusionBValue")
-        .or_else(|_| object.element_by_name("DiffusionBFactor"))
-        .ok()
-        .and_then(element_b_value)
+    None
 }
 
 pub fn parse_csa_b_value(text: &str) -> Option<f64> {
@@ -701,9 +697,15 @@ pub fn save_dicom_series(directory: &Path, map: &mut AdcMap) -> Result<()> {
             format!("2.25.{}", uuid::Uuid::new_v4().as_u128()),
         );
         slice.put_str(tags::IMAGE_TYPE, VR::CS, "DERIVED\\\\SECONDARY\\\\ADC");
-        slice.remove_element_by_name("DiffusionBValue")?;
-        slice.remove_element_by_name("DiffusionBFactor")?;
-        slice.remove_element_by_name("DiffusionGradientDirection")?;
+        for name in [
+            "DiffusionBValue",
+            "DiffusionBFactor",
+            "DiffusionGradientDirection",
+        ] {
+            if slice.element_by_name(name).is_ok() {
+                slice.remove_element_by_name(name)?;
+            }
+        }
         slice.put(DataElement::new(
             tags::INSTANCE_NUMBER,
             VR::IS,

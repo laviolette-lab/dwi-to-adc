@@ -1,6 +1,6 @@
 [package]
 name = "dwi-to-adc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Convert diffusion-weighted MRI data to apparent diffusion coefficient maps"
 license = "MIT"
@@ -23,7 +23,10 @@ clap = { version = "4", features = ["derive"] }
 dicom-core = "0.10"
 dicom-dictionary-std = "0.10"
 dicom-object = "0.10"
-dicom-pixeldata = { version = "0.10", features = ["native", "ndarray"], default-features = false }
+dicom-pixeldata = { version = "0.10", features = [
+    "native",
+    "ndarray",
+], default-features = false }
 ndarray = "0.17"
 nifti = { version = "0.18", features = ["ndarray_volumes"] }
 pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
