@@ -20,6 +20,57 @@ pub enum OutputFormat {
     Dicom,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Model {
+    #[default]
+    Basic,
+    Auto,
+    Ivim,
+    Dki,
+    StretchedExponential,
+}
+
+impl Model {
+    pub fn resolve(self, b_values: &[f64]) -> Result<Self> {
+        let distinct = b_values
+            .iter()
+            .map(|b| (b * 10.0).round() as i64)
+            .collect::<std::collections::HashSet<_>>();
+        let resolved = match self {
+            Self::Auto
+                if b_values.iter().copied().fold(0.0, f64::max) > 1500.0
+                    && distinct.len() >= 4
+                    && b_values.iter().filter(|&&b| b > 0.0).count() >= 3 =>
+            {
+                Self::Dki
+            }
+            Self::Auto
+                if b_values
+                    .iter()
+                    .filter(|&&b| b > 0.0 && b <= 200.0)
+                    .map(|b| (*b * 10.0).round() as i64)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    >= 2
+                    && b_values
+                        .iter()
+                        .filter(|&&b| b > 200.0)
+                        .map(|b| (*b * 10.0).round() as i64)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        >= 2
+                    && distinct.len() >= 4 =>
+            {
+                Self::Ivim
+            }
+            Self::Auto => Self::Basic,
+            model => model,
+        };
+        validate_model(resolved, b_values)?;
+        Ok(resolved)
+    }
+}
+
 pub struct AdcMap {
     pub dimensions: Vec<usize>,
     pub values: Vec<f32>,
@@ -58,6 +109,16 @@ pub fn fit_adc(
     b_values: &[f64],
     axis: usize,
 ) -> Result<Vec<f32>> {
+    fit_model(dimensions, data, b_values, axis, Model::Basic)
+}
+
+pub fn fit_model(
+    dimensions: &[usize],
+    data: &[f32],
+    b_values: &[f64],
+    axis: usize,
+    model: Model,
+) -> Result<Vec<f32>> {
     if dimensions.len() < 2 || axis >= dimensions.len() {
         bail!("invalid volume dimensions or diffusion axis");
     }
@@ -68,18 +129,19 @@ pub fn fit_adc(
             b_values.len()
         );
     }
-    let voxel_count = dimensions.iter().product::<usize>();
-    if voxel_count != data.len() {
+    if dimensions.iter().product::<usize>() != data.len() {
         bail!("volume dimensions do not match image data");
     }
-    let nonzero = b_values.iter().filter(|&&b| b > 0.0).count();
-    if nonzero == 0 {
-        bail!("at least one non-zero b-value is required");
+    if b_values.iter().any(|b| !b.is_finite() || *b < 0.0)
+        || !b_values.contains(&0.0)
+        || !b_values.iter().any(|b| *b > 0.0)
+    {
+        bail!("model fitting requires finite non-negative b-values including b=0 and b>0");
     }
+    let model = model.resolve(b_values)?;
     let mut output_dimensions = dimensions.to_vec();
     output_dimensions.remove(axis);
-    let output_len = output_dimensions.iter().product::<usize>();
-    let mut output = vec![0.0; output_len];
+    let mut output = vec![0.0; output_dimensions.iter().product()];
     let baseline_indices = b_values
         .iter()
         .enumerate()
@@ -89,55 +151,233 @@ pub fn fit_adc(
         let mut remainder = voxel;
         let mut coordinates = vec![0; dimensions.len()];
         for dimension in (0..dimensions.len()).rev() {
-            if dimension == axis {
-                continue;
+            if dimension != axis {
+                coordinates[dimension] = remainder % dimensions[dimension];
+                remainder /= dimensions[dimension];
             }
-            coordinates[dimension] = remainder % dimensions[dimension];
-            remainder /= dimensions[dimension];
         }
-        let mut flat_index = |axis_index: usize| {
-            coordinates[axis] = axis_index;
-            coordinates
+        let mut signals = Vec::with_capacity(b_values.len());
+        for (index, &b) in b_values.iter().enumerate() {
+            coordinates[axis] = index;
+            let flat = coordinates
                 .iter()
                 .zip(dimensions)
-                .fold(0usize, |index, (&coordinate, &size)| {
-                    index * size + coordinate
-                })
-        };
-        let baseline_count = baseline_indices
+                .fold(0usize, |flat, (&coordinate, &size)| {
+                    flat * size + coordinate
+                });
+            signals.push((b, data[flat] as f64));
+        }
+        let baseline_values = baseline_indices
             .iter()
             .filter_map(|&index| {
-                let value = data[flat_index(index)];
-                (value.is_finite() && value > 0.0).then_some(value as f64)
+                let (_, signal) = signals[index];
+                (signal.is_finite() && signal > 0.0).then_some(signal)
             })
             .collect::<Vec<_>>();
-        let Some(baseline) = (!baseline_count.is_empty())
-            .then(|| baseline_count.iter().sum::<f64>() / baseline_count.len() as f64)
+        let Some(baseline) = (!baseline_values.is_empty())
+            .then(|| baseline_values.iter().sum::<f64>() / baseline_values.len() as f64)
         else {
             continue;
         };
-        let mut sum_bb = 0.0;
-        let mut sum_by = 0.0;
-        for (volume, &b) in b_values.iter().enumerate() {
-            if b == 0.0 {
-                continue;
-            }
-            let signal = data[flat_index(volume)];
-            if !signal.is_finite() || signal <= 0.0 {
-                continue;
-            }
-            let y = (signal as f64 / baseline).ln();
-            sum_bb += b * b;
-            sum_by += b * y;
-        }
-        if sum_bb > f64::EPSILON {
-            let slope = sum_by / sum_bb;
-            if slope.is_finite() && slope < 0.0 {
-                *result = (-slope) as f32;
-            }
+        let samples = signals
+            .iter()
+            .filter_map(|&(b, signal)| {
+                (b > 0.0 && signal.is_finite() && signal > 0.0)
+                    .then_some((b, (signal / baseline).ln()))
+            })
+            .collect::<Vec<_>>();
+        let fitted = match model {
+            Model::Basic => fit_mono(&samples),
+            Model::Dki => fit_dki(&samples),
+            Model::Ivim => fit_ivim(&signals, baseline),
+            Model::StretchedExponential => fit_stretched(&samples),
+            Model::Auto => unreachable!(),
+        };
+        if let Some(value) = fitted.filter(|value| value.is_finite() && *value > 0.0) {
+            *result = value as f32;
         }
     }
     Ok(output)
+}
+
+fn fit_mono(samples: &[(f64, f64)]) -> Option<f64> {
+    let (sum_bb, sum_by) = samples
+        .iter()
+        .fold((0.0, 0.0), |(bb, by), &(b, y)| (bb + b * b, by + b * y));
+    (sum_bb > f64::EPSILON).then_some(-sum_by / sum_bb)
+}
+
+fn fit_dki(samples: &[(f64, f64)]) -> Option<f64> {
+    if samples.len() < 3 {
+        return None;
+    }
+    let (mut a, mut b, mut c, mut d, mut e, mut y0, mut y1, mut y2) =
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(x, y) in samples {
+        let x2 = x * x;
+        a += x2;
+        b += x * x2;
+        c += x2 * x2;
+        d += x;
+        e += x2;
+        y0 += x * y;
+        y1 += x2 * y;
+        y2 += y;
+    }
+    let n = samples.len() as f64;
+    let det = a * (c * n - e * e) - b * (b * n - e * d) + d * (b * e - c * d);
+    if det.abs() < f64::EPSILON {
+        return None;
+    }
+    let det_slope = y0 * (c * n - e * e) - b * (y1 * n - e * y2) + d * (y1 * e - c * y2);
+    let slope = det_slope / det;
+    let det_quad = a * (y1 * n - e * y2) - y0 * (b * n - e * d) + d * (b * y2 - y1 * d);
+    let quadratic = det_quad / det;
+    let diffusion = -slope;
+    let kurtosis = 6.0 * quadratic / (diffusion * diffusion);
+    (diffusion > 0.0 && kurtosis.is_finite() && (0.0..=3.0).contains(&kurtosis))
+        .then_some(diffusion)
+}
+
+fn fit_ivim(signals: &[(f64, f64)], baseline: f64) -> Option<f64> {
+    let samples = signals
+        .iter()
+        .filter_map(|&(b, signal)| {
+            (b > 0.0 && signal.is_finite() && signal > 0.0).then_some((b, signal / baseline))
+        })
+        .collect::<Vec<_>>();
+    if samples
+        .iter()
+        .filter(|(b, _)| *b <= 200.0)
+        .map(|(b, _)| (*b * 10.0).round() as i64)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        < 2
+        || samples
+            .iter()
+            .filter(|(b, _)| *b > 200.0)
+            .map(|(b, _)| (*b * 10.0).round() as i64)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            < 2
+    {
+        return None;
+    }
+    let high = samples
+        .iter()
+        .filter(|(b, _)| *b > 200.0)
+        .map(|(b, s)| (*b, s.ln()))
+        .collect::<Vec<_>>();
+    let mut best = None;
+    let mut best_error = f64::INFINITY;
+    for dstar in [0.005, 0.01, 0.02, 0.04, 0.08, 0.15, 0.3] {
+        for fraction_step in 1..=40 {
+            let fraction = fraction_step as f64 / 100.0;
+            let adjusted = high
+                .iter()
+                .filter_map(|&(b, signal)| {
+                    let tissue_signal =
+                        (signal.exp() - fraction * (-b * dstar).exp()) / (1.0 - fraction);
+                    (tissue_signal.is_finite() && tissue_signal > 0.0)
+                        .then_some((b, tissue_signal.ln()))
+                })
+                .collect::<Vec<_>>();
+            let Some(diffusion) = fit_mono(&adjusted).filter(|d| (0.0..=0.005).contains(d)) else {
+                continue;
+            };
+            let error = samples
+                .iter()
+                .map(|&(b, observed)| {
+                    let predicted =
+                        (1.0 - fraction) * (-b * diffusion).exp() + fraction * (-b * dstar).exp();
+                    (observed - predicted).powi(2)
+                })
+                .sum::<f64>();
+            if error < best_error {
+                best_error = error;
+                best = Some(diffusion);
+            }
+        }
+    }
+    best
+}
+
+fn fit_stretched(samples: &[(f64, f64)]) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let mut best = None;
+    let mut best_error = f64::INFINITY;
+    for step in 30..=100 {
+        let alpha = step as f64 / 100.0;
+        let numerator = samples
+            .iter()
+            .map(|&(b, y)| b.powf(alpha) * -y)
+            .sum::<f64>();
+        let denominator = samples
+            .iter()
+            .map(|&(b, _)| b.powf(2.0 * alpha))
+            .sum::<f64>();
+        if denominator <= f64::EPSILON {
+            continue;
+        }
+        let coefficient = numerator / denominator;
+        if !coefficient.is_finite() || coefficient <= 0.0 {
+            continue;
+        }
+        let diffusion = coefficient.powf(1.0 / alpha);
+        let error = samples
+            .iter()
+            .map(|&(b, y)| (y + coefficient * b.powf(alpha)).powi(2))
+            .sum::<f64>();
+        if diffusion.is_finite() && error < best_error {
+            best_error = error;
+            best = Some(diffusion);
+        }
+    }
+    best
+}
+
+fn validate_model(model: Model, b_values: &[f64]) -> Result<()> {
+    let distinct = b_values
+        .iter()
+        .map(|b| (b * 10.0).round() as i64)
+        .collect::<std::collections::HashSet<_>>();
+    let distinct_low = b_values
+        .iter()
+        .filter(|&&b| b > 0.0 && b <= 200.0)
+        .map(|b| (*b * 10.0).round() as i64)
+        .collect::<std::collections::HashSet<_>>();
+    match model {
+        Model::Ivim
+            if distinct_low.len() < 2
+                || b_values
+                    .iter()
+                    .filter(|&&b| b > 200.0)
+                    .map(|b| (*b * 10.0).round() as i64)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    < 2 =>
+        {
+            bail!(
+                "IVIM requires at least two distinct low b-values (≤200) and two distinct higher b-values"
+            );
+        }
+        Model::Dki
+            if distinct.len() < 4
+                || b_values.iter().copied().fold(0.0, f64::max) <= 1500.0
+                || b_values.iter().filter(|&&b| b > 0.0).count() < 3 =>
+        {
+            bail!(
+                "DKI requires at least four distinct b-values and a maximum b-value of 1500 or higher"
+            );
+        }
+        Model::StretchedExponential if distinct.len() < 3 => {
+            bail!("stretched-exponential fitting requires at least three distinct b-values");
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn read_nifti(path: &Path) -> Result<AdcMap> {
@@ -185,6 +425,15 @@ pub fn validate_bvecs(path: &Path, expected: usize) -> Result<()> {
 }
 
 pub fn load_nifti_adc(input: &Path, bvals: &Path, bvecs: Option<&Path>) -> Result<AdcMap> {
+    load_nifti_model(input, bvals, bvecs, Model::Basic)
+}
+
+pub fn load_nifti_model(
+    input: &Path,
+    bvals: &Path,
+    bvecs: Option<&Path>,
+    model: Model,
+) -> Result<AdcMap> {
     let b_values = parse_vector_file(bvals)?;
     if let Some(bvecs) = bvecs {
         validate_bvecs(bvecs, b_values.len())?;
@@ -194,7 +443,7 @@ pub fn load_nifti_adc(input: &Path, bvals: &Path, bvecs: Option<&Path>) -> Resul
         bail!("DWI NIfTI must have at least four dimensions");
     }
     let axis = map.dimensions.len() - 1;
-    let values = fit_adc(&map.dimensions, &map.values, &b_values, axis)?;
+    let values = fit_model(&map.dimensions, &map.values, &b_values, axis, model)?;
     map.dimensions.remove(axis);
     map.values = values;
     Ok(map)
@@ -324,7 +573,11 @@ pub fn parse_csa_b_value(text: &str) -> Option<f64> {
 type DicomImage = (Vec<f32>, PathBuf);
 type DicomVolume = Vec<Vec<DicomImage>>;
 
-fn read_dicom_series(directory: &Path, supplied_bvals: Option<&[f64]>) -> Result<AdcMap> {
+fn read_dicom_series(
+    directory: &Path,
+    supplied_bvals: Option<&[f64]>,
+    model: Model,
+) -> Result<AdcMap> {
     use dicom_object::open_file;
     use dicom_pixeldata::PixelDecoder;
     let mut paths = fs::read_dir(directory)
@@ -541,11 +794,12 @@ fn read_dicom_series(directory: &Path, supplied_bvals: Option<&[f64]>) -> Result
             }
         }
     }
-    let values = fit_adc(
+    let values = fit_model(
         &[positions.len(), rows, columns, b_values.len()],
         &data,
         &b_values,
         3,
+        model,
     )?;
     Ok(AdcMap {
         dimensions: vec![positions.len(), rows, columns],
@@ -562,13 +816,27 @@ pub fn convert(
     bvals: Option<&Path>,
     bvecs: Option<&Path>,
 ) -> Result<()> {
+    convert_with_model(input, output, format, bvals, bvecs, Model::Basic)
+}
+
+pub fn convert_with_model(
+    input: &Path,
+    output: &Path,
+    format: InputFormat,
+    bvals: Option<&Path>,
+    bvecs: Option<&Path>,
+    model: Model,
+) -> Result<()> {
     let mut map = match format {
-        InputFormat::Nifti => {
-            load_nifti_adc(input, bvals.context("NIfTI input requires --bval")?, bvecs)?
-        }
+        InputFormat::Nifti => load_nifti_model(
+            input,
+            bvals.context("NIfTI input requires --bval")?,
+            bvecs,
+            model,
+        )?,
         InputFormat::Dicom => {
             let parsed_bvals = bvals.map(parse_vector_file).transpose()?;
-            read_dicom_series(input, parsed_bvals.as_deref())?
+            read_dicom_series(input, parsed_bvals.as_deref(), model)?
         }
     };
     match output.extension().and_then(|extension| extension.to_str()) {

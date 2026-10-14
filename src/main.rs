@@ -1,11 +1,32 @@
 use clap::{Parser, ValueEnum};
-use dwi_to_adc::{InputFormat, convert};
+use dwi_to_adc::{InputFormat, Model, convert_with_model};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Format {
     Nifti,
     Dicom,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ModelArg {
+    Basic,
+    Auto,
+    Ivim,
+    Dki,
+    StretchedExponential,
+}
+
+impl From<ModelArg> for Model {
+    fn from(model: ModelArg) -> Self {
+        match model {
+            ModelArg::Basic => Self::Basic,
+            ModelArg::Auto => Self::Auto,
+            ModelArg::Ivim => Self::Ivim,
+            ModelArg::Dki => Self::Dki,
+            ModelArg::StretchedExponential => Self::StretchedExponential,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -21,9 +42,12 @@ struct Args {
     /// FSL .bval file (required for NIfTI; manual fallback for unsupported DICOM tags)
     #[arg(long)]
     bval: Option<PathBuf>,
-    /// Optional FSL b-vectors file; validated but not used by scalar ADC fitting
+    /// Optional FSL b-vectors file; validated but not used by scalar fitting
     #[arg(long)]
     bvec: Option<PathBuf>,
+    /// Fitting model (default: basic)
+    #[arg(long, value_enum, default_value_t = ModelArg::Basic)]
+    model: ModelArg,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -39,12 +63,13 @@ fn main() -> anyhow::Result<()> {
         Format::Nifti => InputFormat::Nifti,
         Format::Dicom => InputFormat::Dicom,
     };
-    convert(
+    convert_with_model(
         &args.input,
         &args.output,
         format,
         args.bval.as_deref(),
         args.bvec.as_deref(),
+        args.model.into(),
     )?;
     Ok(())
 }

@@ -14,10 +14,16 @@ def main() -> None:
     parser.add_argument("--input-format", choices=("nifti", "dicom"))
     parser.add_argument("--bval", type=Path, help="FSL .bval file")
     parser.add_argument("--bvec", type=Path, help="Optional FSL .bvec file")
+    parser.add_argument(
+        "--model",
+        choices=("basic", "auto", "ivim", "dki", "stretched-exponential"),
+        default="basic",
+        help="Fitting model (default: basic)",
+    )
     args = parser.parse_args()
     input_format = args.input_format or ("dicom" if args.input.is_dir() else "nifti")
     try:
-        convert(args.input, args.output, input_format, args.bval, args.bvec)
+        convert(args.input, args.output, input_format, args.bval, args.bvec, args.model)
     except Exception as error:
         parser.exit(1, f"dwi-to-adc: error: {error}\n")
 

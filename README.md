@@ -8,7 +8,18 @@ Rust command-line program and Python package for generating scalar apparent diff
 - A directory of single-frame DICOM images from one diffusion series. The reader checks standard diffusion sequences/tags, Siemens CSA headers, and known Siemens, GE, Philips, Canon/Toshiba, and UIH private b-value tags. If b-values cannot be extracted, provide a manual FSL `.bval` file with `--bval`; the tool reports this fallback and asks users to open an issue if the format is not supported. Multi-frame Enhanced DICOM is not yet supported.
 - NIfTI ADC output (`.nii` or `.nii.gz`) or a directory of derived DICOM slices.
 
-ADC is estimated by linear least squares of $\ln(S/S_0)$ versus b-value using all positive b-values and the mean available b=0 image. Non-positive/non-finite signals and non-decaying fits produce zero. ADC values are in mm²/s when input b-values use s/mm².
+Basic mode estimates ADC by linear least squares of $\ln(S/S_0)$ versus b-value using all positive b-values and the mean available b=0 image. Non-positive/non-finite signals and non-decaying fits produce zero. ADC values are in mm²/s when input b-values use s/mm². Other modes export one scalar map only: IVIM's tissue diffusion coefficient $D$, DKI's diffusion coefficient $D$, or the stretched-exponential diffusion coefficient. The additional IVIM perfusion fraction/diffusion, DKI kurtosis, and stretched-exponential heterogeneity parameter are not exported. These research models are experimental and are not validated for clinical decision-making.
+
+## Fitting models
+
+The default is `basic`, preserving the standard ADC workflow. Use `--model auto` to select DKI when maximum b-value exceeds 1500 s/mm² and the data have at least four distinct b-values; otherwise, auto selects IVIM if there are at least two distinct low b-values (≤200 s/mm²), a higher b-value, and at least four distinct values; otherwise it falls back to basic ADC. Advanced models validate their minimum b-value requirements and fail with an explanatory error if unsupported by the acquisition.
+
+Available options are `basic`, `auto`, `ivim`, `dki`, and `stretched-exponential`:
+
+```sh
+./target/release/dwi-to-adc DWI.nii.gz ADC.nii.gz --bval DWI.bval --model auto
+./target/release/dwi-to-adc ./dicom-series ADC-dicom/ --input-format dicom --model ivim
+```
 
 ## Standalone binary
 
