@@ -1,0 +1,50 @@
+use clap::{Parser, ValueEnum};
+use dwi_to_adc::{InputFormat, convert};
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Format {
+    Nifti,
+    Dicom,
+}
+
+#[derive(Debug, Parser)]
+#[command(version, about = "Convert diffusion-weighted MRI data to ADC maps")]
+struct Args {
+    /// Input NIfTI file or directory containing DICOM slices
+    input: PathBuf,
+    /// Output .nii/.nii.gz path or directory for DICOM slices
+    output: PathBuf,
+    /// Input format (inferred from input path when omitted)
+    #[arg(long, value_enum)]
+    input_format: Option<Format>,
+    /// FSL .bval file (required for NIfTI; manual fallback for unsupported DICOM tags)
+    #[arg(long)]
+    bval: Option<PathBuf>,
+    /// Optional FSL b-vectors file; validated but not used by scalar ADC fitting
+    #[arg(long)]
+    bvec: Option<PathBuf>,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let format = args.input_format.unwrap_or_else(|| {
+        if args.input.is_dir() {
+            Format::Dicom
+        } else {
+            Format::Nifti
+        }
+    });
+    let format = match format {
+        Format::Nifti => InputFormat::Nifti,
+        Format::Dicom => InputFormat::Dicom,
+    };
+    convert(
+        &args.input,
+        &args.output,
+        format,
+        args.bval.as_deref(),
+        args.bvec.as_deref(),
+    )?;
+    Ok(())
+}

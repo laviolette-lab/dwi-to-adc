@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "lavlab-adc"
+dynamic = ["version"]
+description = "Convert diffusion-weighted MRI data to ADC maps"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[project.scripts]
+dwi-to-adc = "dwi_to_adc:main"
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"
+module-name = "dwi_to_adc._native"

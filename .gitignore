@@ -1,0 +1,33 @@
+# Rust build output
+/target/
+
+# Local Python environments, caches, and packaging output
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.dll
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+/build/
+/dist/
+/wheels/
+*.egg-info/
+
+# Local input/output imaging data
+*.dcm
+*.bval
+*.bvec
+*.nii
+*.nii.gz
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store

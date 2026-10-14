@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheels:
+    name: Build ${{ matrix.platform }} wheel
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - platform: macos-aarch64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            manylinux: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --features python --out dist --target ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  build-standalone:
+    name: Build ${{ matrix.platform }} standalone
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: macos-aarch64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --locked --release --bin dwi-to-adc --target ${{ matrix.target }}
+      - name: Package executable and checksum
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          archive="dwi-to-adc-${{ matrix.platform }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "release-assets/$archive" dwi-to-adc
+          shasum -a 256 "release-assets/$archive" > "release-assets/$archive.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.platform }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-pypi:
+    name: Publish wheels to PyPI
+    needs: [build-wheels, build-standalone]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/lavlab-adc
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  upload-release-assets:
+    name: Attach standalone binaries to GitHub release
+    needs: [build-wheels, build-standalone]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: standalone-*
+          path: release-assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
+  publish-ghcr:
+    name: Publish minimal image to GHCR
+    needs: [build-wheels, build-standalone]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ github.event.release.tag_name }}
+            type=raw,value=latest
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
